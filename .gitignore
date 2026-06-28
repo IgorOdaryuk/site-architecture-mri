@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.DS_Store
+architecture_pages.csv
+architecture_summary.json
+architecture_map.html
