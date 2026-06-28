@@ -1,10 +1,16 @@
-import requests, re, json, csv, sys, time, html
+import argparse
+import csv
+import html
+import json
+import re
+import time
 import xml.etree.ElementTree as ET
-from bs4 import BeautifulSoup
+from collections import Counter, defaultdict, deque
 from urllib.parse import urljoin, urlparse
-from collections import defaultdict, Counter, deque
 
-DOMAIN = "https://odariuk.com"
+import requests
+from bs4 import BeautifulSoup
+
 MAX_PAGES = 300
 DELAY = 0.05
 
@@ -12,69 +18,115 @@ OUT_CSV = "architecture_pages.csv"
 OUT_JSON = "architecture_summary.json"
 OUT_HTML = "architecture_map.html"
 
-HEADERS = {"User-Agent": "Mozilla/5.0 ArchitectureEngineBot"}
+HEADERS = {"User-Agent": "Mozilla/5.0 SiteArchitectureMRI"}
 
-EXCLUDE = ["/wp-admin", "/wp-login", "/tag/", "/category/", "/author/", "/page/",
-           ".jpg", ".jpeg", ".png", ".webp", ".gif", ".pdf", ".mp4", ".mp3", ".zip"]
+EXCLUDE = [
+    "/wp-admin",
+    "/wp-login",
+    "/tag/",
+    "/category/",
+    "/author/",
+    "/page/",
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+    ".gif",
+    ".pdf",
+    ".mp4",
+    ".mp3",
+    ".zip",
+]
 
-def clean(x):
-    return re.sub(r"\s+", " ", x or "").strip()
 
-def norm(url):
-    p = urlparse(url)
-    return p._replace(fragment="", query="").geturl().rstrip("/")
+def clean(value):
+    return re.sub(r"\s+", " ", value or "").strip()
 
-def same_domain(url):
-    return urlparse(url).netloc.replace("www.", "") == urlparse(DOMAIN).netloc.replace("www.", "")
 
-def skip(url):
-    return any(x in url.lower() for x in EXCLUDE)
+def normalize_url(url):
+    parsed = urlparse(url)
+    return parsed._replace(fragment="", query="").geturl().rstrip("/")
+
+
+def get_domain(url):
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+
+
+def same_domain(url, domain):
+    return (
+        urlparse(url).netloc.replace("www.", "")
+        == urlparse(domain).netloc.replace("www.", "")
+    )
+
+
+def should_skip(url):
+    return any(part in url.lower() for part in EXCLUDE)
+
 
 def fetch(url):
     try:
-        r = requests.get(url, headers=HEADERS, timeout=10)
-        if "text/html" not in r.headers.get("content-type", ""):
+        response = requests.get(url, headers=HEADERS, timeout=10)
+        content_type = response.headers.get("content-type", "")
+
+        if "text/html" not in content_type:
             return None, None
-        return r, BeautifulSoup(r.text, "html.parser")
+
+        return response, BeautifulSoup(response.text, "html.parser")
     except Exception:
         return None, None
 
-def sitemap_urls():
+
+def sitemap_urls(domain):
     urls = []
+
     try:
-        r = requests.get(DOMAIN.rstrip("/") + "/sitemap.xml", headers=HEADERS, timeout=10)
-        root = ET.fromstring(r.text)
-        ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
-        for loc in root.findall(".//sm:loc", ns):
-            u = norm(loc.text.strip())
-            if same_domain(u) and not skip(u):
-                urls.append(u)
-    except Exception as e:
-        print("sitemap failed:", e)
+        sitemap_url = domain.rstrip("/") + "/sitemap.xml"
+        response = requests.get(sitemap_url, headers=HEADERS, timeout=10)
+        root = ET.fromstring(response.text)
+
+        namespace = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+
+        for loc in root.findall(".//sm:loc", namespace):
+            url = normalize_url(loc.text.strip())
+
+            if same_domain(url, domain) and not should_skip(url):
+                urls.append(url)
+
+    except Exception as error:
+        print("sitemap failed:", error)
+
     return list(dict.fromkeys(urls))
 
-def extract_page(url, depth):
-    r, soup = fetch(url)
-    if not r or not soup:
+
+def extract_page(url, depth, domain):
+    response, soup = fetch(url)
+
+    if not response or not soup:
         return None, []
 
     title = clean(soup.title.text if soup.title else "")
-    h1 = " | ".join(clean(x.get_text(" ")) for x in soup.find_all("h1"))
-    h2s = [clean(x.get_text(" ")) for x in soup.find_all("h2")]
+    h1 = " | ".join(clean(item.get_text(" ")) for item in soup.find_all("h1"))
+    h2s = [clean(item.get_text(" ")) for item in soup.find_all("h2")]
     text = clean(soup.get_text(" "))
 
     links = []
-    for a in soup.find_all("a", href=True):
-        href = norm(urljoin(url, a["href"].strip()))
-        if same_domain(href) and not skip(href):
+
+    for tag in soup.find_all("a", href=True):
+        href = normalize_url(urljoin(url, tag["href"].strip()))
+
+        if same_domain(href, domain) and not should_skip(href):
             links.append(href)
 
-    embed_text = clean((title + " " + h1 + " " + " ".join(h2s) + " " + text[:6000]).lower())
+    embed_text = clean(
+        (title + " " + h1 + " " + " ".join(h2s) + " " + text[:6000]).lower()
+    )
 
     return {
         "url": url,
+        "path": url.replace(domain, "") or "/",
         "depth": depth,
-        "status": r.status_code,
+        "status": response.status_code,
         "title": title,
         "h1": h1,
         "h2_count": len(h2s),
@@ -83,30 +135,37 @@ def extract_page(url, depth):
         "cluster": None,
         "cluster_label": None,
         "cluster_status": None,
-        "pagerank": 0
-    }, links
+        "pagerank": 0,
+        "inbound_links": 0,
+        "outbound_links": 0,
+    }, list(dict.fromkeys(links))
 
-def crawl():
-    seeds = sitemap_urls()
+
+def crawl(domain, max_pages=MAX_PAGES):
+    seeds = sitemap_urls(domain)
+
     if seeds:
         print(f"SITEMAP URLS FOUND: {len(seeds)}")
-        q = deque([(u, 0) for u in seeds])
+        queue = deque([(url, 0) for url in seeds])
     else:
-        q = deque([(DOMAIN.rstrip("/"), 0)])
+        queue = deque([(domain.rstrip("/"), 0)])
 
-    seen, rows, edges = set(), [], []
+    seen = set()
+    rows = []
+    edges = []
 
-    while q and len(seen) < MAX_PAGES:
-        url, depth = q.popleft()
-        url = norm(url)
+    while queue and len(seen) < max_pages:
+        url, depth = queue.popleft()
+        url = normalize_url(url)
 
-        if url in seen or skip(url):
+        if url in seen or should_skip(url):
             continue
 
         seen.add(url)
         print(f"[{len(seen)}] {url}")
 
-        row, links = extract_page(url, depth)
+        row, links = extract_page(url, depth, domain)
+
         if not row:
             continue
 
@@ -114,46 +173,56 @@ def crawl():
 
         for link in links:
             edges.append({"from": url, "to": link})
-            if link not in seen and len(seen) + len(q) < MAX_PAGES:
-                q.append((link, depth + 1))
+
+            if link not in seen and len(seen) + len(queue) < max_pages:
+                queue.append((link, depth + 1))
 
         time.sleep(DELAY)
 
     return rows, edges
 
-def label_cluster(pages):
-    raw = " ".join((p["title"] + " " + p["h1"]).lower() for p in pages)
 
-    stop = set("""
-    the and for with this that from your you are have has was were will not but how what why when into about
-    local business businesses service services blog post guide page ihor odariuk home don need needs know
-    """.split())
+def label_cluster(pages):
+    raw = " ".join((page["title"] + " " + page["h1"]).lower() for page in pages)
+
+    stop = set(
+        """
+        the and for with this that from your you are have has was were will not but
+        how what why when into about local business businesses service services
+        blog post guide page ihor odariuk home don need needs know
+        """.split()
+    )
 
     words = re.findall(r"\b[a-zA-Z][a-zA-Z\-]{2,}\b", raw)
-    words = [w for w in words if w not in stop]
+    words = [word for word in words if word not in stop]
 
     phrases = []
-    phrases += [" ".join(words[i:i+3]) for i in range(len(words)-2)]
-    phrases += [" ".join(words[i:i+2]) for i in range(len(words)-1)]
+    phrases += [" ".join(words[i : i + 3]) for i in range(len(words) - 2)]
+    phrases += [" ".join(words[i : i + 2]) for i in range(len(words) - 1)]
     phrases += words
 
     best = []
+
     for phrase, count in Counter(phrases).most_common(30):
         if len(phrase) < 4:
             continue
+
         if phrase in best:
             continue
+
         best.append(phrase)
+
         if len(best) >= 3:
             break
 
-    return " / ".join(x.title() for x in best) if best else "Cluster"
+    return " / ".join(item.title() for item in best) if best else "Cluster"
+
 
 def cluster_pages(rows, requested_clusters=None):
     from sentence_transformers import SentenceTransformer
     from sklearn.cluster import KMeans
 
-    texts = [r["text_for_embedding"][:6000] for r in rows]
+    texts = [row["text_for_embedding"][:6000] for row in rows]
 
     print("Loading local embedding model...")
     model = SentenceTransformer("all-MiniLM-L6-v2")
@@ -161,78 +230,121 @@ def cluster_pages(rows, requested_clusters=None):
     print("Creating embeddings...")
     embeddings = model.encode(texts, show_progress_bar=True, normalize_embeddings=True)
 
-    n = len(rows)
-    k = int(requested_clusters) if requested_clusters else max(2, min(8, round(n ** 0.5)))
-    k = max(2, min(k, n))
+    page_count = len(rows)
+    cluster_count = (
+        int(requested_clusters)
+        if requested_clusters
+        else max(2, min(8, round(page_count**0.5)))
+    )
 
-    print(f"Clustering into {k} clusters...")
-    km = KMeans(n_clusters=k, random_state=42, n_init="auto")
-    labels = km.fit_predict(embeddings)
+    cluster_count = max(2, min(cluster_count, page_count))
 
-    for r, label in zip(rows, labels):
-        r["cluster"] = int(label)
+    print(f"Clustering into {cluster_count} clusters...")
+    kmeans = KMeans(n_clusters=cluster_count, random_state=42, n_init="auto")
+    labels = kmeans.fit_predict(embeddings)
+
+    for row, label in zip(rows, labels):
+        row["cluster"] = int(label)
 
     grouped = defaultdict(list)
-    for r in rows:
-        grouped[r["cluster"]].append(r)
 
-    for cid, pages in grouped.items():
+    for row in rows:
+        grouped[row["cluster"]].append(row)
+
+    for cluster_id, pages in grouped.items():
         label = label_cluster(pages)
-        status = "strong cluster" if len(pages) >= 3 else ("weak cluster" if len(pages) == 2 else "orphan topic")
-        for p in pages:
-            p["cluster_label"] = label
-            p["cluster_status"] = status
+
+        if len(pages) >= 3:
+            status = "strong cluster"
+        elif len(pages) == 2:
+            status = "weak cluster"
+        else:
+            status = "orphan topic"
+
+        for page in pages:
+            page["cluster_label"] = label
+            page["cluster_status"] = status
 
     return grouped
 
+
+def build_link_maps(edges, urlset):
+    inbound = defaultdict(set)
+    outbound = defaultdict(set)
+
+    for edge in edges:
+        source = edge["from"]
+        target = edge["to"]
+
+        if source in urlset and target in urlset and source != target:
+            outbound[source].add(target)
+            inbound[target].add(source)
+
+    return inbound, outbound
+
+
 def pagerank(rows, edges, iterations=30, damping=0.85):
-    urls = [r["url"] for r in rows]
+    urls = [row["url"] for row in rows]
     urlset = set(urls)
-    outlinks = defaultdict(list)
+    inbound, outbound = build_link_maps(edges, urlset)
 
-    for e in edges:
-        if e["from"] in urlset and e["to"] in urlset:
-            outlinks[e["from"]].append(e["to"])
+    page_count = len(urls)
 
-    n = len(urls)
-    if not n:
+    if not page_count:
         return {}
 
-    pr = {u: 1 / n for u in urls}
+    scores = {url: 1 / page_count for url in urls}
 
     for _ in range(iterations):
-        new = {u: (1 - damping) / n for u in urls}
-        for u in urls:
-            targets = outlinks.get(u, [])
+        new_scores = {url: (1 - damping) / page_count for url in urls}
+
+        for url in urls:
+            targets = list(outbound.get(url, []))
+
             if targets:
-                share = pr[u] / len(targets)
-                for v in targets:
-                    new[v] += damping * share
+                share = scores[url] / len(targets)
+
+                for target in targets:
+                    new_scores[target] += damping * share
             else:
-                share = pr[u] / n
-                for v in urls:
-                    new[v] += damping * share
-        pr = new
+                share = scores[url] / page_count
 
-    return pr
+                for target in urls:
+                    new_scores[target] += damping * share
 
-def build_html(summary):
+        scores = new_scores
+
+    return scores
+
+
+def build_html(summary, domain):
     cards = ""
 
-    for c in summary["clusters"]:
+    for cluster in summary["clusters"]:
         cards += '<section class="cluster">'
-        cards += f'<h2>{html.escape(c["label"])}</h2>'
-        cards += f'<div class="meta">{c["pages"]} pages · {html.escape(c["status"])} · authority {c["internal_authority"]:.3f}</div>'
+        cards += f'<h2>{html.escape(cluster["label"])}</h2>'
+        cards += (
+            f'<div class="meta">{cluster["pages"]} pages · '
+            f'{html.escape(cluster["status"])} · '
+            f'authority {cluster["internal_authority"]:.3f}</div>'
+        )
 
-        for p in c["top_pages"]:
-            path = p["url"].replace(DOMAIN, "") or "/"
+        for page in cluster["top_pages"]:
+            path = page["url"].replace(domain, "") or "/"
+
             cards += '<div class="page">'
-            cards += f'<a href="{html.escape(p["url"])}" target="_blank">{html.escape(path)}</a>'
-            cards += f'<small>{html.escape(p["title"][:120])}</small>'
-            cards += f'<small>PR {p["pagerank"]:.4f}</small>'
-            cards += '</div>'
+            cards += (
+                f'<a href="{html.escape(page["url"])}" target="_blank">'
+                f"{html.escape(path)}</a>"
+            )
+            cards += f'<small>{html.escape(page["title"][:120])}</small>'
+            cards += (
+                f'<small>PR {page["pagerank"]:.4f} · '
+                f'in {page["inbound_links"]} · out {page["outbound_links"]}</small>'
+            )
+            cards += "</div>"
 
-        cards += '</section>'
+        cards += "</section>"
 
     doc = f"""<!doctype html>
 <html>
@@ -255,7 +367,7 @@ small {{ display:block; color:#888; margin-top:4px; line-height:1.35; }}
 <body>
 <header>
 <h1>Architecture Map: {html.escape(summary["domain"])}</h1>
-<p>Local embeddings + automatic clusters. Strong = 3+ pages, weak = 2 pages, orphan = 1 page.</p>
+<p>Local embeddings + clusters + PageRank + real internal link graph.</p>
 </header>
 <div class="grid">
 {cards}
@@ -263,81 +375,115 @@ small {{ display:block; color:#888; margin-top:4px; line-height:1.35; }}
 </body>
 </html>"""
 
-    with open(OUT_HTML, "w", encoding="utf-8") as f:
-        f.write(doc)
+    with open(OUT_HTML, "w", encoding="utf-8") as file:
+        file.write(doc)
 
-def save(rows, edges, grouped):
-    pr = pagerank(rows, edges)
 
-    for r in rows:
-        r["pagerank"] = pr.get(r["url"], 0)
+def save(rows, edges, grouped, domain):
+    urlset = {row["url"] for row in rows}
+    inbound, outbound = build_link_maps(edges, urlset)
+    scores = pagerank(rows, edges)
+
+    clean_edges = []
+
+    for edge in edges:
+        if edge["from"] in urlset and edge["to"] in urlset and edge["from"] != edge["to"]:
+            clean_edges.append(edge)
+
+    for row in rows:
+        url = row["url"]
+        row["pagerank"] = scores.get(url, 0)
+        row["inbound_links"] = len(inbound.get(url, set()))
+        row["outbound_links"] = len(outbound.get(url, set()))
 
     public_rows = []
-    for r in rows:
-        rr = dict(r)
-        rr.pop("text_for_embedding", None)
-        public_rows.append(rr)
 
-    fields = sorted(set().union(*(r.keys() for r in public_rows)))
-    with open(OUT_CSV, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader()
-        w.writerows(public_rows)
+    for row in rows:
+        item = dict(row)
+        item.pop("text_for_embedding", None)
+        public_rows.append(item)
+
+    fields = sorted(set().union(*(row.keys() for row in public_rows)))
+
+    with open(OUT_CSV, "w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(public_rows)
 
     cluster_summary = []
-    for cid, pages in grouped.items():
-        total_pr = sum(p.get("pagerank", 0) for p in pages)
+
+    for cluster_id, pages in grouped.items():
+        total_pagerank = sum(page.get("pagerank", 0) for page in pages)
+
         top_pages = sorted(
-            [{"url": p["url"], "title": p["title"], "pagerank": p["pagerank"]} for p in pages],
-            key=lambda x: x["pagerank"],
-            reverse=True
+            [
+                {
+                    "url": page["url"],
+                    "title": page["title"],
+                    "pagerank": page["pagerank"],
+                    "inbound_links": page["inbound_links"],
+                    "outbound_links": page["outbound_links"],
+                }
+                for page in pages
+            ],
+            key=lambda item: item["pagerank"],
+            reverse=True,
         )[:10]
 
-        cluster_summary.append({
-            "cluster": int(cid),
-            "label": pages[0]["cluster_label"],
-            "pages": len(pages),
-            "status": pages[0]["cluster_status"],
-            "internal_authority": total_pr,
-            "top_pages": top_pages
-        })
+        cluster_summary.append(
+            {
+                "cluster": int(cluster_id),
+                "label": pages[0]["cluster_label"],
+                "pages": len(pages),
+                "status": pages[0]["cluster_status"],
+                "internal_authority": total_pagerank,
+                "top_pages": top_pages,
+            }
+        )
 
-    cluster_summary = sorted(cluster_summary, key=lambda x: x["internal_authority"], reverse=True)
+    cluster_summary = sorted(
+        cluster_summary, key=lambda item: item["internal_authority"], reverse=True
+    )
 
     diagnosis = []
-    for c in cluster_summary:
-        if c["status"] == "orphan topic":
-            diagnosis.append(f"Orphan topic: {c['label']}")
-        elif c["status"] == "weak cluster":
-            diagnosis.append(f"Weak cluster: {c['label']}")
 
-    url_to_cluster = {r["url"]: r["cluster_label"] for r in rows}
+    for cluster in cluster_summary:
+        if cluster["status"] == "orphan topic":
+            diagnosis.append(f"Orphan topic: {cluster['label']}")
+        elif cluster["status"] == "weak cluster":
+            diagnosis.append(f"Weak cluster: {cluster['label']}")
+
+    url_to_cluster = {row["url"]: row["cluster_label"] for row in rows}
     cluster_links = defaultdict(int)
 
-    for e in edges:
-        src = url_to_cluster.get(e["from"])
-        dst = url_to_cluster.get(e["to"])
-        if src and dst and src != dst:
-            cluster_links[(src, dst)] += 1
+    for edge in clean_edges:
+        source_cluster = url_to_cluster.get(edge["from"])
+        target_cluster = url_to_cluster.get(edge["to"])
+
+        if source_cluster and target_cluster and source_cluster != target_cluster:
+            cluster_links[(source_cluster, target_cluster)] += 1
 
     cluster_links_out = [
-        {"from": a, "to": b, "links": n}
-        for (a, b), n in sorted(cluster_links.items(), key=lambda x: x[1], reverse=True)
+        {"from": source, "to": target, "links": count}
+        for (source, target), count in sorted(
+            cluster_links.items(), key=lambda item: item[1], reverse=True
+        )
     ]
 
     summary = {
-        "domain": DOMAIN,
+        "domain": domain,
         "pages": len(rows),
-        "edges": len(edges),
+        "edges_count": len(clean_edges),
+        "edges": clean_edges,
         "clusters": cluster_summary,
         "cluster_links": cluster_links_out,
-        "diagnosis": diagnosis
+        "diagnosis": diagnosis,
     }
 
-    with open(OUT_JSON, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2, ensure_ascii=False)
+    with open(OUT_JSON, "w", encoding="utf-8") as file:
+        json.dump(summary, file, indent=2, ensure_ascii=False)
 
-    build_html(summary)
+    build_html(summary, domain)
 
     print("\nDONE")
     print("CSV:", OUT_CSV)
@@ -345,36 +491,39 @@ def save(rows, edges, grouped):
     print("HTML:", OUT_HTML)
 
     print("\nCLUSTERS:")
-    for c in cluster_summary:
-        print(f"- {c['label']}: {c['pages']} pages — {c['status']} — authority {c['internal_authority']:.3f}")
-
-    print("\nCLUSTER LINKS:")
-    for link in cluster_links_out[:20]:
-        print(f"- {link['from']} -> {link['to']}: {link['links']} links")
+    for cluster in cluster_summary:
+        print(
+            f"- {cluster['label']}: {cluster['pages']} pages — "
+            f"{cluster['status']} — authority {cluster['internal_authority']:.3f}"
+        )
 
     print("\nDIAGNOSIS:")
-    for d in diagnosis:
-        print("-", d)
+    for item in diagnosis:
+        print("-", item)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Site Architecture MRI")
+    parser.add_argument("domain", help="Website URL, e.g. https://example.com")
+    parser.add_argument("--clusters", type=int, default=None)
+    parser.add_argument("--max-pages", type=int, default=MAX_PAGES)
+    return parser.parse_args()
+
 
 def main():
-    global DOMAIN
+    args = parse_args()
 
-    args = sys.argv[1:]
-    if args and not args[0].startswith("--"):
-        DOMAIN = args[0].rstrip("/")
+    domain = get_domain(args.domain.rstrip("/"))
 
-    requested_clusters = None
-    if "--clusters" in args:
-        i = args.index("--clusters")
-        requested_clusters = int(args[i + 1])
+    rows, edges = crawl(domain, max_pages=args.max_pages)
 
-    rows, edges = crawl()
     if not rows:
         print("No pages found")
         return
 
-    grouped = cluster_pages(rows, requested_clusters)
-    save(rows, edges, grouped)
+    grouped = cluster_pages(rows, args.clusters)
+    save(rows, edges, grouped, domain)
+
 
 if __name__ == "__main__":
     main()
