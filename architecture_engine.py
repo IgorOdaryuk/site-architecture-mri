@@ -78,25 +78,38 @@ def fetch(url):
 
 
 def sitemap_urls(domain):
+    """Page URLs from /sitemap.xml, following sitemap indexes one level down.
+
+    WordPress and most SEO plugins publish an index that points at post-,
+    page- and category-sitemaps; the index itself lists no pages.
+    """
+    namespace = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+
+    def read(url):
+        response = requests.get(url, headers=HEADERS, timeout=10)
+        return ET.fromstring(response.text)
+
     urls = []
-
     try:
-        sitemap_url = domain.rstrip("/") + "/sitemap.xml"
-        response = requests.get(sitemap_url, headers=HEADERS, timeout=10)
-        root = ET.fromstring(response.text)
-
-        namespace = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
-
-        for loc in root.findall(".//sm:loc", namespace):
-            url = normalize_url(loc.text.strip())
-
-            if same_domain(url, domain) and not should_skip(url):
-                urls.append(url)
-
+        root = read(domain.rstrip("/") + "/sitemap.xml")
+        children = [loc.text.strip() for loc in root.findall(".//sm:sitemap/sm:loc", namespace)]
+        for child in children:
+            try:
+                root_child = read(child)
+            except Exception as error:
+                print("sitemap failed:", child, error)
+                continue
+            urls += [loc.text.strip() for loc in root_child.findall(".//sm:url/sm:loc", namespace)]
+        urls += [loc.text.strip() for loc in root.findall(".//sm:url/sm:loc", namespace)]
     except Exception as error:
         print("sitemap failed:", error)
 
-    return list(dict.fromkeys(urls))
+    out = []
+    for raw in urls:
+        url = normalize_url(raw)
+        if same_domain(url, domain) and not should_skip(url) and not url.endswith(".xml"):
+            out.append(url)
+    return list(dict.fromkeys(out))
 
 
 def extract_page(url, depth, domain):
@@ -182,40 +195,90 @@ def crawl(domain, max_pages=MAX_PAGES):
     return rows, edges
 
 
-def label_cluster(pages):
-    raw = " ".join((page["title"] + " " + page["h1"]).lower() for page in pages)
+STOP = set(
+    """
+    the and for with this that from your you are have has was were will not but
+    how what why when into about our its can all any more most best top new vs
+    page home blog post guide www com html php
+    """.split()
+)
 
-    stop = set(
-        """
-        the and for with this that from your you are have has was were will not but
-        how what why when into about local business businesses service services
-        blog post guide page ihor odariuk home don need needs know
-        """.split()
-    )
 
-    words = re.findall(r"\b[a-zA-Z][a-zA-Z\-]{2,}\b", raw)
-    words = [word for word in words if word not in stop]
+def page_phrases(page, site_words=frozenset()):
+    """Words and two-word phrases, each built inside ONE title/H1/slug.
 
-    phrases = []
-    phrases += [" ".join(words[i : i + 3]) for i in range(len(words) - 2)]
-    phrases += [" ".join(words[i : i + 2]) for i in range(len(words) - 1)]
-    phrases += words
+    Phrases never cross from one page into the next: gluing a cluster's titles
+    into one string is what produced labels like "Calls Found Uncomfortable".
+    """
+    sources = [page["title"], page["h1"], page["path"].replace("-", " ").replace("/", " ")]
+    out = []
+    for source in sources:
+        for part in re.split(r"[|:–—•·()\[\],?!]+| - ", source.lower()):
+            words = [
+                w for w in re.findall(r"[a-z][a-z0-9']{2,}", part)
+                if w not in STOP and w not in site_words
+            ]
+            out += words
+            out += [f"{words[i]} {words[i + 1]}" for i in range(len(words) - 1)]
+    return out
 
-    best = []
 
-    for phrase, count in Counter(phrases).most_common(30):
-        if len(phrase) < 4:
-            continue
+def site_wide_words(rows, share=0.4):
+    """Words on most pages of the site (brand name in every title) say nothing."""
+    if len(rows) < 5:
+        return frozenset()
+    df = Counter()
+    for row in rows:
+        df.update(set(re.findall(r"[a-z][a-z0-9']{2,}", (row["title"] + " " + row["h1"]).lower())))
+    return frozenset(w for w, n in df.items() if n / len(rows) >= share)
 
-        if phrase in best:
-            continue
 
-        best.append(phrase)
+def label_clusters(grouped, rows):
+    """c-TF-IDF: a term names a cluster when it is frequent there and rare elsewhere."""
+    import math
 
-        if len(best) >= 3:
-            break
+    site_words = site_wide_words(rows)
+    tf = {}
+    for cid, pages in grouped.items():
+        counts = Counter()
+        for page in pages:
+            # A phrase counts once per page, so one long title cannot dominate.
+            counts.update(set(page_phrases(page, site_words)))
+        tf[cid] = counts
 
-    return " / ".join(item.title() for item in best) if best else "Cluster"
+    across = Counter()
+    for counts in tf.values():
+        across.update(counts)
+    avg_size = sum(sum(c.values()) for c in tf.values()) / max(1, len(tf))
+
+    labels = {}
+    for cid, counts in tf.items():
+        size = len(grouped[cid])
+        scored = []
+        for term, n in counts.items():
+            if size >= 3 and n < 2:
+                continue  # one page's title is not the cluster's topic
+            score = (n / size) * math.log(1 + avg_size / across[term])
+            if " " in term:
+                score *= 1.3  # "bass strings" names a topic better than "strings"
+            scored.append((score, term))
+        scored.sort(reverse=True)
+
+        chosen = []
+        used = set()
+        top = scored[0][0] if scored else 0
+        for score, term in scored:
+            words = set(term.split())
+            if words & used:
+                continue  # "Stingray Review" after "Musicman Stingray" adds nothing
+            if chosen and score < 0.6 * top:
+                break  # a weak second word only muddies the name
+            chosen.append(term)
+            used |= words
+            if len(chosen) == 2:
+                break
+        labels[cid] = " · ".join(t.title() for t in chosen) if chosen else f"Cluster {cid + 1}"
+    return labels
 
 
 def cluster_pages(rows, requested_clusters=None):
@@ -251,8 +314,10 @@ def cluster_pages(rows, requested_clusters=None):
     for row in rows:
         grouped[row["cluster"]].append(row)
 
+    labels_by_cluster = label_clusters(grouped, rows)
+
     for cluster_id, pages in grouped.items():
-        label = label_cluster(pages)
+        label = labels_by_cluster[cluster_id]
 
         if len(pages) >= 3:
             status = "strong cluster"
@@ -470,14 +535,32 @@ def save(rows, edges, grouped, domain):
         )
     ]
 
+    home = normalize_url(domain.rstrip("/"))
+    orphans = [r["url"] for r in rows if r["inbound_links"] == 0 and normalize_url(r["url"]) != home]
+    deep = [r["url"] for r in rows if r["depth"] > 3]
+    fed = {link["to"] for link in cluster_links_out}
+    isolated = [c["label"] for c in cluster_summary if c["label"] not in fed and len(cluster_summary) > 1]
+    overview = {
+        "total_pages": len(rows),
+        "internal_links": len(clean_edges),
+        "orphan_pages": len(orphans),
+        "orphan_examples": orphans[:10],
+        "pages_deeper_than_3_clicks": len(deep),
+        "clusters": len(cluster_summary),
+        "strongest_cluster": cluster_summary[0]["label"] if cluster_summary else None,
+        "weakest_cluster": cluster_summary[-1]["label"] if cluster_summary else None,
+        "clusters_no_links_from_other_clusters": isolated,
+    }
+
     summary = {
         "domain": domain,
-        "pages": len(rows),
-        "edges_count": len(clean_edges),
-        "edges": clean_edges,
+        "overview": overview,
         "clusters": cluster_summary,
         "cluster_links": cluster_links_out,
         "diagnosis": diagnosis,
+        "pages": len(rows),
+        "edges_count": len(clean_edges),
+        "edges": clean_edges,
     }
 
     with open(OUT_JSON, "w", encoding="utf-8") as file:
@@ -489,6 +572,11 @@ def save(rows, edges, grouped, domain):
     print("CSV:", OUT_CSV)
     print("JSON:", OUT_JSON)
     print("HTML:", OUT_HTML)
+
+    print("\nOVERVIEW:")
+    for key, value in overview.items():
+        if key != "orphan_examples":
+            print(f"- {key}: {value}")
 
     print("\nCLUSTERS:")
     for cluster in cluster_summary:
