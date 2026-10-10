@@ -281,9 +281,40 @@ def label_clusters(grouped, rows):
     return labels
 
 
+# Pages every site has and no topic owns. Clustering them with the content
+# pulls /about and /privacy into whatever group is largest and makes the labels
+# lie; they are reported as their own group instead.
+CHROME_PATTERNS = (
+    "about", "contact", "privacy", "terms", "cookie", "legal", "disclaimer", "sitemap",
+    "login", "signup", "register", "account", "cart", "checkout", "thank", "careers", "jobs",
+    "gallery", "photos", "testimonials", "reviews", "faq", "blog", "news", "search",
+)
+
+
+def is_chrome(path):
+    p = path.lower().strip("/")
+    if p == "":
+        return True  # the home page belongs to the whole site
+    last = p.split("/")[-1]
+    return any(last == c or last.startswith(c + "-") or last.endswith("-" + c) or p == c
+               for c in CHROME_PATTERNS)
+
+
 def cluster_pages(rows, requested_clusters=None):
     from sentence_transformers import SentenceTransformer
     from sklearn.cluster import KMeans
+
+    chrome = [row for row in rows if is_chrome(row["path"])]
+    rows = [row for row in rows if not is_chrome(row["path"])]
+    for row in chrome:
+        row["cluster"] = -1
+        row["cluster_label"] = "Site pages (home, about, contact, legal)"
+        row["cluster_status"] = "site chrome"
+    if len(rows) < 2:
+        grouped = defaultdict(list)
+        for row in chrome:
+            grouped[-1].append(row)
+        return grouped
 
     texts = [row["text_for_embedding"][:6000] for row in rows]
 
@@ -330,6 +361,8 @@ def cluster_pages(rows, requested_clusters=None):
             page["cluster_label"] = label
             page["cluster_status"] = status
 
+    if chrome:
+        grouped[-1] = chrome
     return grouped
 
 
@@ -509,10 +542,11 @@ def save(rows, edges, grouped, domain):
     cluster_summary = sorted(
         cluster_summary, key=lambda item: item["internal_authority"], reverse=True
     )
+    topic_summary = [c for c in cluster_summary if c["cluster"] != -1]
 
     diagnosis = []
 
-    for cluster in cluster_summary:
+    for cluster in topic_summary:
         if cluster["status"] == "orphan topic":
             diagnosis.append(f"Orphan topic: {cluster['label']}")
         elif cluster["status"] == "weak cluster":
@@ -546,10 +580,10 @@ def save(rows, edges, grouped, domain):
         "orphan_pages": len(orphans),
         "orphan_examples": orphans[:10],
         "pages_deeper_than_3_clicks": len(deep),
-        "clusters": len(cluster_summary),
-        "strongest_cluster": cluster_summary[0]["label"] if cluster_summary else None,
-        "weakest_cluster": cluster_summary[-1]["label"] if cluster_summary else None,
-        "clusters_no_links_from_other_clusters": isolated,
+        "clusters": len(topic_summary),
+        "strongest_cluster": topic_summary[0]["label"] if topic_summary else None,
+        "weakest_cluster": topic_summary[-1]["label"] if topic_summary else None,
+        "clusters_no_links_from_other_clusters": [c for c in isolated if c != "Site pages (home, about, contact, legal)"],
     }
 
     summary = {
