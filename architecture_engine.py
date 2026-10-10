@@ -199,7 +199,7 @@ STOP = set(
     """
     the and for with this that from your you are have has was were will not but
     how what why when into about our its can all any more most best top new vs
-    page home blog post guide www com html php
+    page home blog post guide www com net org html php https http index
     """.split()
 )
 
@@ -210,7 +210,8 @@ def page_phrases(page, site_words=frozenset()):
     Phrases never cross from one page into the next: gluing a cluster's titles
     into one string is what produced labels like "Calls Found Uncomfortable".
     """
-    sources = [page["title"], page["h1"], page["path"].replace("-", " ").replace("/", " ")]
+    path = re.sub(r"^https?://[^/]+", "", page["path"] or "")  # older CSVs stored the full URL
+    sources = [page["title"], page["h1"], path.replace("-", " ").replace("/", " ")]
     out = []
     for source in sources:
         for part in re.split(r"[|:–—•·()\[\],?!]+| - ", source.lower()):
@@ -223,7 +224,7 @@ def page_phrases(page, site_words=frozenset()):
     return out
 
 
-def site_wide_words(rows, share=0.4):
+def site_wide_words(rows, share=0.25):
     """Words on most pages of the site (brand name in every title) say nothing."""
     if len(rows) < 5:
         return frozenset()
